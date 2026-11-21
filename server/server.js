@@ -16,6 +16,7 @@ const JOB_TTL_MS = Number(process.env.JOB_TTL_MS || 60 * 60 * 1000);
 const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
 const FFPROBE_PATH = process.env.FFPROBE_PATH || 'ffprobe';
 const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp';
+const YTDLP_COOKIES_PATH = process.env.YTDLP_COOKIES_PATH || '';
 const WORK_DIR = process.env.WORK_DIR || path.join(os.tmpdir(), 'clipforge-jobs');
 fs.mkdirSync(WORK_DIR, { recursive: true });
 
@@ -154,14 +155,18 @@ app.post('/api/youtube-jobs', async (req, res) => {
       job.progress = 5;
       const section = `*${start}-${end}`;
       const ytResult = await run(YTDLP_PATH, [
-        '--no-playlist', '--no-warnings', '--no-part', '--force-overwrites',
-        '--download-sections', section,
-        '--force-keyframes-at-cuts',
-        '--print', 'after_move:filepath',
-        '-f', 'bv*+ba/b', '--merge-output-format', 'mp4',
-        '-o', sourceTemplate,
-        url
-      ], { timeoutMs: 45 * 60 * 1000 });
+  '--plugin-dirs', path.join(__dirname, 'yt-dlp-plugins'),
+  '--extractor-args',
+  'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
+  '--no-playlist', '--no-warnings', '--no-part', '--force-overwrites',
+  '--download-sections', section,
+  '--force-keyframes-at-cuts',
+  '--print', 'after_move:filepath',
+  '-f', 'bv*+ba/b', '--merge-output-format', 'mp4',
+  '-o', sourceTemplate,
+  ...(YTDLP_COOKIES_PATH ? ['--cookies', YTDLP_COOKIES_PATH] : []),
+  url
+], { timeoutMs: 45 * 60 * 1000 });
       job.progress = 65;
 
       const printedPath = ytResult.stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean).at(-1);
