@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js",
-    "test": "node --test tests/jobTools.test.mjs"
-  },
+  "start": "node server.js",
+  "dev": "node --watch server.js",
+  "test": "node --test tests/jobTools.test.mjs tests/serverSource.test.mjs"
+},
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^5.1.0",

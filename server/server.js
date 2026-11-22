@@ -214,16 +214,16 @@ app.post('/api/youtube-jobs', async (req, res) => {
       job.progress = 5;
       const section = `*${start}-${end}`;
       const ytResult = await run(YTDLP_PATH, [
-  '--plugin-dirs', path.join(__dirname, 'yt-dlp-plugins'),
-  '--extractor-args',
-  'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
-  '--no-playlist', '--no-warnings', '--no-part', '--force-overwrites',
+  '--no-playlist',
+  '--no-warnings',
+  '--no-part',
+  '--force-overwrites',
   '--download-sections', section,
   '--force-keyframes-at-cuts',
   '--print', 'after_move:filepath',
-  '-f', 'bv*+ba/b', '--merge-output-format', 'mp4',
+  '-f', 'bv*+ba/b',
+  '--merge-output-format', 'mp4',
   '-o', sourceTemplate,
-  ...(YTDLP_COOKIES_PATH ? ['--cookies', YTDLP_COOKIES_PATH] : []),
   url
 ], { timeoutMs: 45 * 60 * 1000 });
       job.progress = 65;
