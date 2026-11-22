@@ -6,9 +6,8 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { checkTools, removeJobFiles, safeRemove, sweepExpiredJobs, sweepOrphanFiles } from './jobTools.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3001);
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 1024 * 1024 * 1024);
@@ -18,6 +17,8 @@ const FFPROBE_PATH = process.env.FFPROBE_PATH || 'ffprobe';
 const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp';
 const YTDLP_COOKIES_PATH = process.env.YTDLP_COOKIES_PATH || '';
 const WORK_DIR = process.env.WORK_DIR || path.join(os.tmpdir(), 'clipforge-jobs');
+const TOOL_CACHE_MS = 60 * 1000;
+const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 10 * 60 * 1000);
 fs.mkdirSync(WORK_DIR, { recursive: true });
 
 const app = express();
@@ -107,10 +108,69 @@ function publicJob(job) {
   return { id: job.id, status: job.status, progress: job.progress, error: job.error || null, downloadUrl: job.status === 'completed' ? `/api/jobs/${job.id}/download` : null };
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'ClipForge AI processing API', ffmpeg: FFMPEG_PATH }));
+// ---------------------------------------------------------------------------
+// Tool availability (FFmpeg, FFprobe, yt-dlp). Checked for real by running
+// each program, and cached briefly so frequent health pings stay cheap.
+// ---------------------------------------------------------------------------
+let toolStatus = null;
+let toolStatusAt = 0;
+let toolStatusPending = null;
+
+async function getToolStatus({ force = false } = {}) {
+  if (!force && toolStatus && Date.now() - toolStatusAt < TOOL_CACHE_MS) return toolStatus;
+  if (toolStatusPending) return toolStatusPending;
+  toolStatusPending = checkTools({ ffmpegPath: FFMPEG_PATH, ffprobePath: FFPROBE_PATH, ytdlpPath: YTDLP_PATH })
+    .then(result => {
+      toolStatus = result;
+      toolStatusAt = Date.now();
+      return result;
+    })
+    .finally(() => { toolStatusPending = null; });
+  return toolStatusPending;
+}
+
+function workDirWritable() {
+  try {
+    fs.accessSync(WORK_DIR, fs.constants.R_OK | fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function describeTool(result, configuredPath) {
+  return { ok: result.ok, version: result.version, path: configuredPath, error: result.error || null };
+}
+
+// "ok" means the core upload-and-clip workflow can run (FFmpeg, FFprobe and a
+// writable work folder). YouTube clipping is reported separately, so a missing
+// yt-dlp does not take uploads offline.
+app.get('/api/health', async (req, res) => {
+  const tools = await getToolStatus({ force: req.query.refresh === '1' });
+  const writable = workDirWritable();
+  const coreOk = tools.ffmpeg.ok && tools.ffprobe.ok && writable;
+  const activeJobs = Array.from(jobs.values()).filter(j => j.status === 'queued' || j.status === 'processing').length;
+  res.status(coreOk ? 200 : 503).json({
+    ok: coreOk,
+    service: 'ClipForge AI processing API',
+    time: new Date().toISOString(),
+    uptimeSeconds: Math.round(process.uptime()),
+    node: process.version,
+    tools: {
+      ffmpeg: describeTool(tools.ffmpeg, FFMPEG_PATH),
+      ffprobe: describeTool(tools.ffprobe, FFPROBE_PATH),
+      ytdlp: describeTool(tools.ytdlp, YTDLP_PATH)
+    },
+    workDirWritable: writable,
+    capabilities: { upload: coreOk, youtube: coreOk && tools.ytdlp.ok },
+    activeJobs
+  });
+});
 
 // YouTube URL clipping. Use only for videos the requester owns or is explicitly
 // authorised to download and edit, and only where the acquisition method is permitted.
+// Availability is not guaranteed: YouTube may refuse requests from this server,
+// for example with a "Sign in to confirm you're not a bot" message.
 function isYouTubeUrl(raw) {
   try {
     const u = new URL(raw);
@@ -118,12 +178,6 @@ function isYouTubeUrl(raw) {
     return ['youtube.com', 'm.youtube.com', 'youtu.be', 'youtube-nocookie.com'].includes(host)
       && (u.protocol === 'https:' || u.protocol === 'http:');
   } catch { return false; }
-}
-
-function cleanupJobFiles(id) {
-  for (const name of fs.readdirSync(WORK_DIR)) {
-    if (name.startsWith(`${id}.`)) fs.rmSync(path.join(WORK_DIR, name), { force: true });
-  }
 }
 
 app.post('/api/youtube-jobs', async (req, res) => {
@@ -140,6 +194,11 @@ app.post('/api/youtube-jobs', async (req, res) => {
   }
   if (!['original', '9:16', '1:1'].includes(format) || !['crop', 'blur', 'pad'].includes(fit) || !['normal', 'cinematic', 'zoom', 'fade', 'vibrant', 'warm', 'noir', 'retro', 'dreamy', 'punch'].includes(effect)) {
     return res.status(400).json({ error: 'Invalid export settings.' });
+  }
+
+  const tools = await getToolStatus();
+  if (!tools.ytdlp.ok) {
+    return res.status(503).json({ error: 'YouTube clipping is not available on this server right now (yt-dlp is not installed or not working). Uploading a video file still works.' });
   }
 
   const id = randomUUID();
@@ -192,9 +251,10 @@ app.post('/api/youtube-jobs', async (req, res) => {
     } catch (error) {
       job.status = 'failed';
       job.error = `${error.message || 'YouTube clipping failed.'}`.slice(-2500);
-      fs.rmSync(outputPath, { force: true });
+      safeRemove(outputPath);
     } finally {
-      cleanupJobFiles(id);
+      // Remove the downloaded source only; the finished clip (<id>-clip.mp4) stays for download.
+      removeJobFiles(WORK_DIR, id, { includeOutputs: false });
       job.inputPath = null;
     }
   })();
@@ -208,11 +268,11 @@ app.post('/api/jobs', upload.single('video'), async (req, res) => {
   const fit = req.body.fit || 'crop';
   const effect = req.body.effect || 'normal';
   if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) {
-    fs.rmSync(req.file.path, { force: true });
+    safeRemove(req.file.path);
     return res.status(400).json({ error: 'Enter a valid start and end time.' });
   }
   if (!['original', '9:16', '1:1'].includes(format) || !['crop', 'blur', 'pad'].includes(fit) || !['normal', 'cinematic', 'zoom', 'fade', 'vibrant', 'warm', 'noir', 'retro', 'dreamy', 'punch'].includes(effect)) {
-    fs.rmSync(req.file.path, { force: true });
+    safeRemove(req.file.path);
     return res.status(400).json({ error: 'Invalid export settings.' });
   }
 
@@ -237,9 +297,9 @@ app.post('/api/jobs', upload.single('video'), async (req, res) => {
     } catch (error) {
       job.status = 'failed';
       job.error = error.message || 'Video processing failed.';
-      fs.rmSync(job.outputPath, { force: true });
+      safeRemove(job.outputPath);
     } finally {
-      fs.rmSync(job.inputPath, { force: true });
+      safeRemove(job.inputPath);
     }
   })();
 });
@@ -258,16 +318,25 @@ app.get('/api/jobs/:id/download', (req, res) => {
   res.download(job.outputPath, `clipforge-${job.id.slice(0, 8)}.mp4`);
 });
 
-setInterval(() => {
-  const cutoff = Date.now() - JOB_TTL_MS;
-  for (const [id, job] of jobs) {
-    if (job.createdAt < cutoff) {
-      fs.rmSync(job.inputPath, { force: true });
-      fs.rmSync(job.outputPath, { force: true });
-      jobs.delete(id);
+// Periodic cleanup. The original version called fs.rmSync(job.inputPath) with
+// inputPath === null for YouTube jobs, which threw inside the timer and crashed
+// the whole server about an hour after the first YouTube clip. This version
+// cannot throw: every delete goes through safeRemove and the sweep is wrapped.
+function runCleanup() {
+  try {
+    const removedJobs = sweepExpiredJobs(jobs, { workDir: WORK_DIR, ttlMs: JOB_TTL_MS });
+    const known = new Set();
+    for (const job of jobs.values()) {
+      if (job.inputPath) known.add(job.inputPath);
+      if (job.outputPath) known.add(job.outputPath);
     }
+    const removedFiles = sweepOrphanFiles(WORK_DIR, { ttlMs: JOB_TTL_MS, knownPaths: known });
+    if (removedJobs || removedFiles) console.log(`Cleanup: removed ${removedJobs} expired job(s) and ${removedFiles} stray file(s).`);
+  } catch (error) {
+    console.error('Cleanup failed (server keeps running):', error?.message || error);
   }
-}, 10 * 60 * 1000).unref();
+}
+setInterval(runCleanup, CLEANUP_INTERVAL_MS).unref();
 
 app.use((err, _req, res, _next) => {
   const message = err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE'
@@ -276,8 +345,23 @@ app.use((err, _req, res, _next) => {
   res.status(400).json({ error: message });
 });
 
+process.on('unhandledRejection', reason => {
+  console.error('Unhandled promise rejection (server keeps running):', reason?.stack || reason);
+});
+process.on('uncaughtException', error => {
+  console.error('Uncaught exception, exiting so the host can restart the server:', error?.stack || error);
+  process.exit(1);
+});
+
 app.listen(PORT, () => {
-  console.log(`ClipForge processing API listening on http://localhost:${PORT}`);
-  console.log(`Allowed frontend origin: ${FRONTEND_ORIGIN}`);
-  console.log('Requires FFmpeg, FFprobe and yt-dlp installed and available on PATH for YouTube URL clipping.');
+  console.log(`ClipForge processing API listening on port ${PORT}`);
+  console.log(`Allowed frontend origin(s): ${FRONTEND_ORIGIN}`);
+  console.log(`Work folder: ${WORK_DIR}`);
+  runCleanup(); // remove files left over from a previous run
+  getToolStatus({ force: true }).then(tools => {
+    for (const [name, tool] of Object.entries(tools)) {
+      console.log(tool.ok ? `Tool check OK: ${name} ${tool.version}` : `Tool check FAILED: ${name} - ${tool.error}`);
+    }
+    if (!tools.ytdlp.ok) console.log('YouTube URL clipping is unavailable until yt-dlp works. Upload clipping is not affected.');
+  });
 });
